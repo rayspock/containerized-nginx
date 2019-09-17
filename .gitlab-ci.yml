@@ -1,0 +1,65 @@
+image: ubuntu:latest
+services:
+  - docker:dind
+
+variables:
+  DOCKER_HOST: tcp://docker:2375
+  DOCKER_DRIVER: overlay2
+  REGION: us-east-1
+  ECS_KILL_TIMEOUT: 150
+  SERVICE_DEFINITION_NAME: sygna_trust_stg
+  SERVICE_NAME: sygna_trust_stg
+  CLUSTER_NAME: sygna_trust_stg
+  SERVICE_DESIRED_COUNT: 1
+
+stages:
+  - release_stg
+  - deploy_stg
+
+.before_script_template: &before_release
+  before_script:
+    - apt update
+    - apt install -y docker docker.io python python-pip jq
+    - pip install awscli
+    - docker info
+
+.script_template: &release_script
+  script:
+    - docker build --no-cache -t $IMAGE_NAME
+      --build-arg PORT=$PORT
+      --build-arg WORK_CONNS=$WORK_CONNS
+      --build-arg ORDER_PORT=$ORDER_PORT
+      --build-arg CARD_PORT=$CARD_PORT .
+    - $(AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY aws ecr get-login --no-include-email --region us-east-1)
+    - docker tag $IMAGE_NAME:latest $ECR_URL
+    - docker push $ECR_URL
+
+release_stg:
+  stage: release_stg
+  environment:
+    name: stg
+  <<: *before_release
+  <<: *release_script
+  only:
+    - stg
+  except:
+    changes:
+      - README.md
+
+deploy_stg:
+  stage: deploy_stg
+  <<: *before_release
+  script:
+    - CURRENT_TASK_COUNT=`AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID} AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY} aws ecs list-tasks --region ${REGION} --cluster ${CLUSTER_NAME} --desired-status RUNNING --family ${SERVICE_DEFINITION_NAME} | jq --raw-output ".taskArns" | jq length`
+    - CURRENT_TASKS=`AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID} AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY} aws ecs list-tasks --region ${REGION} --cluster ${CLUSTER_NAME} --desired-status RUNNING --family ${SERVICE_DEFINITION_NAME} | jq --raw-output ".taskArns"`
+    - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID} AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY} aws ecs update-service --region ${REGION} --service ${SERVICE_NAME} --cluster ${CLUSTER_NAME} --desired-count ${SERVICE_DESIRED_COUNT} --force-new-deployment
+    - sleep ${ECS_KILL_TIMEOUT}
+    - >
+      for ((i = 1; i <= $CURRENT_TASK_COUNT; i++))
+      do
+        TASK=`echo $CURRENT_TASKS | jq --raw-output ".[$i-1]"`
+        aws ecs stop-task --region ${REGION} --cluster ${CLUSTER_NAME} --task $TASK;
+      done
+  only:
+    - stg
+
